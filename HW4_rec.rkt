@@ -1,0 +1,278 @@
+#lang plai
+
+(require (for-syntax racket/base) racket/match racket/list racket/string
+         (only-in mzlib/string read-from-string-all))
+
+;; build a regexp that matches restricted character expressions, can use only
+;; {}s for lists, and limited strings that use '...' (normal racket escapes
+;; like \n, and '' for a single ')
+(define good-char "(?:[ \t\r\na-zA-Z0-9_{}!?*/<=>:+-]|[.][.][.])")
+;; this would make it awkward for students to use \" for strings
+;; (define good-string "\"[^\"\\]*(?:\\\\.[^\"\\]*)*\"")
+(define good-string "[^\"\\']*(?:''[^\"\\']*)*")
+(define expr-re
+  (regexp (string-append "^"
+                         good-char"*"
+                         "(?:'"good-string"'"good-char"*)*"
+                         "$")))
+(define string-re
+  (regexp (string-append "'("good-string")'")))
+
+(define (string->sexpr str)
+  (unless (string? str)
+    (error 'string->sexpr "expects argument of type <string>"))
+    (unless (regexp-match expr-re str)
+      (error 'string->sexpr "syntax error (bad contents)"))
+    (let ([sexprs (read-from-string-all
+                 (regexp-replace*
+                  "''" (regexp-replace* string-re str "\"\\1\"") "'"))])
+    (if (= 1 (length sexprs))
+      (car sexprs)
+      (error 'string->sexpr "bad syntax (multiple expressions)"))))
+
+(define-type FunDef
+ [fundef (fname symbol?) (args list?) (body FnWAE?)])
+
+(define-type FnWAE
+ [num (n number?)]
+ [add (lhs FnWAE?) (rhs FnWAE?)]
+ [sub (lhs FnWAE?) (rhs FnWAE?)]
+ [with (name symbol?) (named-expr FnWAE?) (body FnWAE?)]
+ [id (name symbol?)]
+ [app (ftn symbol?) (arg list?)]
+ [rec (elem (listof (cons/c symbol? FnWAE?)))]
+ [get (body FnWAE?) (name symbol?)])
+
+; parse : sexp -> FnWAE
+(define (parse sexp)
+ (match sexp
+  [(? number?) (num sexp)]
+  [(list '+ l r) (add (parse l) (parse r))]
+  [(list '- l r) (sub (parse l) (parse r))]
+  [(list 'with (list x i) b) (with x (parse i) (parse b))]
+  [(list 'rec li ...) (rec (map (lambda (a)
+                                (cons (first a) (parse (second a)))) li))]
+  [(list 'get b n) (get (parse b) n)]
+  [(? symbol?) (id sexp)]
+  [(list f a ...) (app f (map parse a))]
+  [else (error 'parse "bad syntax: ~a" sexp)]))
+  
+; parse-defn : sexp -> FunDef-
+(define (parse-defn sexp)
+ (match sexp
+  [(list 'deffun (list f x ...) body)
+   (unless (uniq? x)
+    (error 'parse-defn "bad syntax"))
+   (fundef f x (parse body))]))
+
+; uniq? : list-of-symbol -> bool
+(define (uniq? x)
+  (equal? x (remove-duplicates x)))
+
+; list-of-fundef : list -> list
+(define (list-of-fundef li)
+  (cond
+    [(empty? li) '()]
+    [else (cons (first li) (list-of-fundef (rest li)))]))
+
+; lookup-fundef : symbol list-of-FunDef -> FunDef
+(define (lookup-fundef name fundefs)
+  (cond
+    [(empty? fundefs)
+     (error 'lookup-fundef "unknown function")]
+    [else
+     (if (symbol=? name (fundef-fname (first fundefs)))
+         (first fundefs)
+         (lookup-fundef name (rest fundefs)))]))
+
+; subst : FnWAE list-of-symbols FnWAE -> FnWAE
+(define (subst exp args vals)
+  (cond
+    [(empty? args) exp]
+    [else
+     (local
+       [(define arg (first args))]
+       (define val (first vals))
+       (define sub_exp (subst exp (rest args) (rest vals)))
+       (type-case FnWAE sub_exp
+         [num (n) sub_exp]
+         [add (l r) (add (subst l (cons arg empty) (cons val empty)) (subst r (cons arg empty) (cons val empty)))]
+         [sub (l r) (sub (subst l (cons arg empty) (cons val empty)) (subst r (cons arg empty) (cons val empty)))]
+         [with (y i b) (with y
+                             (subst i (cons arg empty) (cons val empty))
+                             (if (symbol=? y arg) b
+                                 (subst b (cons arg empty) (cons val empty))))]
+         [id (name) (cond [(equal? name arg) val]
+                       [else sub_exp])]
+         [rec (li)
+           (rec (map (lambda (x)
+                  (cons (car x) (subst (cdr x) (cons arg empty) (cons val empty)))) li))]
+         [get (b a) (get (subst b args vals) a)]
+         [app (f a) (app f (map (lambda (a_a)
+                               (subst a_a (cons arg empty) (cons val empty))) a))]))]))
+
+; lookup-rec
+(define (lookup-rec li a)
+  (local
+    [(define list-of-sym (map car li))]
+    (cond
+      [(equal? (remove-duplicates list-of-sym) list-of-sym)
+       (cond
+         [(empty? li) empty]
+         [else
+          (cond
+            [(equal? (car (first li)) a) (cdr (first li))]
+            [else
+             (lookup-rec (rest li) a)])])]
+      [else (error 'lookup-rec "duplicate fields")])))
+    
+
+; interp-get
+(define (interp-get b a fundefs)
+  (local
+    [(define sth (lookup-rec (rec-elem (interp b fundefs)) a))]
+    (cond
+      [(empty? sth) (error 'interp-get "no such field")]
+      [else (interp sth fundefs)])))
+
+
+; interp : FnWAE list-of-FunDef -> number
+(define (interp fnwae fundefs)
+  (type-case FnWAE fnwae
+    [num (n) n]
+    [add (l r) (+ (interp l fundefs) (interp r fundefs))]
+    [sub (l r) (- (interp l fundefs) (interp r fundefs))]
+    [with (x i b) (interp (subst b (cons x empty) (cons 
+                                                   (local
+                                                     [(define sth (interp i fundefs))]
+                                                     (cond
+                                                       [(FnWAE? sth) sth]
+                                                       [else (parse sth)])) empty)) fundefs)]
+    [id (s) (error 'interp "free variable")]
+    [rec (li) (rec (map (lambda (x)
+                          (cons (car x) 
+                                (local 
+                                  [(define sth (interp (cdr x) fundefs))]
+                                  (cond
+                                    [(FnWAE? sth) sth]
+                                    [else (parse sth)])))) li))]
+    [get (b a)
+         (interp-get b a fundefs)]
+    [app (f a)
+         (local
+           [(define a-fundef (lookup-fundef f fundefs))]
+           (cond
+             [(equal? (length a) (length (fundef-args a-fundef)))
+              (interp (subst (fundef-body a-fundef)
+                             (fundef-args a-fundef)
+                             a) fundefs)]
+             [else (error 'interp "wrong arity")]))]))
+
+; final-interp
+(define (final-interp whatisthis fundef)
+  (cond
+    [(number? whatisthis) whatisthis]
+    [else 'record]))
+
+; run
+(define (run str deffun)
+  (final-interp (interp (parse (string->sexpr str)) (list-of-fundef deffun)) (list-of-fundef deffun)))
+
+; tests
+(test (run "{f 1 2}" (list (parse-defn '{deffun {f x y} {+ x y}}))) 3)
+(test (run "{+ {f} {f}}" (list (parse-defn '{deffun {f} 5}))) 10)
+(test/exn (run "{f 1}" (list (parse-defn '{deffun {f x y} {+ x y}})))
+          "wrong arity")
+
+(test (run "{rec {a 10} {b {+ 1 2}}}" empty)
+      'record)
+(test (run "{get {rec {a 10} {b {+ 1 2}}} b}" empty)
+      3)
+(test/exn (run "{get {rec {b 10} {b {+ 1 2}}} b}" empty)
+          "duplicate fields")
+(test/exn (run "{get {rec {a 10}} b}" empty)
+          "no such field")
+(test (run "{g {rec {a 0} {c 12} {b 7}}}"
+           (list (parse-defn '{deffun {g r} {get r c}})))
+      12)
+(test (run "{get {rec {r {rec {z 0}}}} r}" empty)
+      'record)
+(test (run "{get {get {rec {r {rec {z 0}}}} r} z}" empty)
+      0)
+(test/exn (run "{rec {z {get {rec {z 0}} y}}}" empty)
+          "no such field")
+(test (run "{with {x {f 2 5}} {g x}}" (list (parse-defn '{deffun {f a b} {+ a b}}) (parse-defn '{deffun {g x} {- x 5}}))) 2)
+(test (run "{f 1 2}" (list (parse-defn '{deffun {f x y} {+ x y}}))) 3)
+(test (run "{+ {f} {f}}" (list (parse-defn '{deffun {f} 5}))) 10)
+(test (run "{h 1 4 5 6}" (list (parse-defn '{deffun {h x y z w} {+ x w}}) (parse-defn '{deffun {g x y z w} {+ y z}}))) 7)
+(test (run "{with {x 10} {- {+ x {f}} {g 4}}}" (list (parse-defn '{deffun {f} 4}) (parse-defn '{deffun {g x} {+ x x}}))) 6)
+
+(test (run "{rec {a 10} {b {+ 1 2}}}" empty) 'record)
+(test (run "{get {rec {a 10} {b {+ 1 2}}} b}" empty) 3)
+(test (run "{g {rec {a 0} {c 12} {b 7}}}" (list (parse-defn '{deffun {g r} {get r c}}))) 12)
+(test (run "{get {rec {r {rec {z 0}}}} r}" empty) 'record)
+(test (run "{get {get {rec {r {rec {z 0}}}} r} z}" empty) 0)
+(test (run "{with {x 3} {with {y 5} {get {rec {a x} {b y}} a}}}" empty) 3)
+(test (run "{with {x {f {rec {a 10} {b 5}} 2}} {g x}}" (list (parse-defn '{deffun {f a b} {+ {get a a} b}}) (parse-defn '{deffun {g x} {+ 5 x}}))) 17)
+(test (run "{get {f 1 2 3 4 5} c}" (list (parse-defn '{deffun {f a b c d e} {rec {a a} {b b} {c c} {d d} {e e}}}))) 3)
+(test (run "{get {f 1 2 3} b}" (list (parse-defn '{deffun {f a b c} {rec {a a} {b b} {c c}}}))) 2)
+(test (run "{get {f 1 2 3} y}" (list (parse-defn '{deffun {f a b c} {rec {x a} {y b} {z c} {d 2} {e 3}}}))) 2)
+(test (run "{get {f 1 2 3} d}" (list (parse-defn '{deffun {f a b c} {rec {x a} {y b} {z c} {d 2} {e 3}}}))) 2)
+(test (run "{f {get {get {rec {a {rec {a 10} {b {- 5 2}}}} {b {get {rec {x 50}} x}}} a} b}}" (list (parse-defn '{deffun {f x} {+ 5 x}}))) 8)
+(test (run "{get {rec {a 10} {b {+ 1 2}}} b}" empty) 3)
+(test (run "{g {rec {a 0} {c 12} {b 7}}}" (list (parse-defn '{deffun {g r} {get r c}}))) 12)
+(test (run "{get {rec {r {rec {z 0}}}} r}" empty) 'record)
+(test (run "{get {get {rec {r {rec {z 0}}}} r} z}" empty) 0)
+(test (run "{rec {a 10}}" empty) `record)
+(test (run "{get {rec {a 10}} a}" empty) 10)
+(test (run "{get {rec {a {+ 1 2}}} a}" empty) 3)
+(test (run "{rec }" empty) `record)
+(test (run "{get {rec {a {rec {b 10}}}} a}" empty) `record)
+(test (run "{get {get {rec {a {rec {a 10}}}} a} a}" empty) 10)
+(test (run "{get {get {rec {a {rec {a 10} {b 20}}}} a} a}" empty) 10)
+(test (run "{get {get {rec {a {rec {a 10} {b 20}}}} a} b}" empty) 20)
+(test (run "{+ {get {rec {a 10}} a} {get {rec {a 20}} a}}" empty) 30)
+(test (run "{+ {get {rec {a 10}} a} {get {rec {a 20}} a}}" empty) 30)
+(test (run "{rec {a 10}}" empty) `record)
+(test (run "{rec {a {- 2 1}}}" empty) `record)
+(test (run "{get {rec {a 10}} a}" empty) 10)
+(test (run "{get {rec {a {- 2 1}}} a}" empty) 1)
+(test (run "{get {rec {a {rec {b 10}}}} a}" empty) `record)
+(test (run "{get {get {rec {a {rec {a 10}}}} a} a}" empty) 10)
+(test (run "{get {get {rec {a {rec {a 10} {b 20}}}} a} a}" empty) 10)
+(test (run "{get {get {rec {a {rec {a 10} {b 20}}}} a} b}" empty) 20)
+(test (run "{rec {a 10} {b {+ 1 2}}}" empty) 'record)
+(test (run "{get {rec {a 10} {b {+ 1 2}}} b}" empty) 3)
+(test (run "{get {rec {r {rec {z 0}}}} r}" empty) 'record)
+(test (run "{get {get {rec {r {rec {z 0}}}} r} z}" empty) 0)
+(test (run "{rec {a 10} {b {+ 1 2}}}" empty) 'record)
+(test (run "{get {rec {a 10} {b {+ 1 2}}} b}" empty) 3)
+(test (run "{g {rec {a 0} {c 12} {b 7}}}" (list (parse-defn '{deffun {g r} {get r c}}))) 12)
+(test (run "{get {rec {r {rec {z 0}}}} r}" empty) 'record)
+(test (run "{get {get {rec {r {rec {z 0}}}} r} z}" empty) 0)
+(test (run "{with {y {rec {x 1} {y 2} {z 3}}} {get y y}}" empty) 2)
+(test (run "{with {y {rec {x 1} {y 2} {z 3}}} {get y z}}" empty) 3)
+(test (run "{rec {a 10} {b {+ 1 2}}}" empty) 'record)
+(test (run "{get {rec {a 10} {b {+ 1 2}}} b}" empty) 3)
+(test (run "{g {rec {a 0} {c 12} {b 7}}}" (list (parse-defn '{deffun {g r} {get r c}}))) 12)
+(test (run "{get {rec {r {rec {z 0}}}} r}" empty) 'record)
+(test (run "{get {get {rec {r {rec {z 0}}}} r} z}" empty) 0)
+
+;
+(test (run "{with {y 3} {rec {a 1} {b y} {c {- 8 y}} {d {+ y 4}} {e 9}}}" empty) 'record)
+(test (run "{with {x 5} {get {with {y 3} {rec {a 1} {b y} {c 5} {d {+ y 4}} {e 9}}} d}}" empty) 7)
+(test (run "{get {f 2 4} y}" (list (parse-defn '{deffun {f x y} {rec {x {+ x 2}} {y {- y 3}}}}))) 1)
+(test (run "{f {rec {x {- 5 3}} {y 6}}}" (list (parse-defn '{deffun {f x} {get x x}}))) 2)
+(test (run "{f 7}" (list (parse-defn '{deffun {f x} {with {x {+ x 3}} {+ x x}}}))) 20)
+(test (run "{f {g 2 3} 4}" (list (parse-defn '{deffun {f x y} {with {x x} {+ x y}}}) (parse-defn '{deffun {g x y} {- x y}}))) 3)
+
+(test (run "{+ 1 2}" empty) 3)
+(test (run "{- 1 2}" empty) -1)
+(test (run "{with {x 7} {+ 2 x}}" empty) 9)
+(test (run "{with {x 3} {func 2 x}}" (list (parse-defn '{deffun {func x y} {+ x y}}))) 5)
+(test (run "{f1 6 2 3}" (list (parse-defn '{deffun {f1 x y z} {+ x {f2 y z}}})
+                              (parse-defn '{deffun {f2 x y} {- {+ x y} 5}}))) 6)
+(test (run "{func 1 2 3 4}" (list (parse-defn '{deffun {func a b c d} {+ {- a b} {- c d}}}))) -2)
+(test/exn (run "{f1 6 2 3}" (list (parse-defn '{deffun {f1 x y z} {+ x {+ y z}}})
+                              (parse-defn '{deffun {f1 x y} {- {+ x y} 5}}))) 
+          "duplicate function name")
